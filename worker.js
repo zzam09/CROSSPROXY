@@ -23,17 +23,16 @@ export default {
       }
       
       const xml = await response.text();
-      const doc = new DOMParser().parseFromString(xml, "text/xml");
-      const parserError = doc.querySelector("parsererror");
       
-      if (parserError) {
+      // Parse XML using regex for Cloudflare Workers environment
+      const clean = parseRss(xml);
+      
+      if (clean.error) {
         return new Response(
           JSON.stringify({ error: "Invalid XML from upstream" }),
           { status: 502, headers: { "Content-Type": "application/json" } }
         );
       }
-      
-      const clean = parseRss(doc);
       
       return new Response(JSON.stringify(clean, null, 2), {
         headers: {
@@ -50,49 +49,111 @@ export default {
   }
 };
 
-function childText(el, tag) {
-  const found = el.querySelector(tag);
-  return found ? (found.textContent || "").trim() : null;
-}
 
-function parseItem(item) {
-  return {
-    title: childText(item, "title"),
-    link: childText(item, "link"),
-    description: childText(item, "description") ?? childText(item, "summary"),
-    pubDate: childText(item, "pubDate") ?? childText(item, "published") ?? childText(item, "updated"),
-    guid: childText(item, "guid") ?? childText(item, "id"),
-    author: childText(item, "author") ?? childText(item, "dc\\:creator"),
-    category: [...item.querySelectorAll("category")]
-      .map(c => c.textContent.trim())
-      .filter(Boolean)
-  };
-}
-
-function parseRss(doc) {
-  const feed = doc.querySelector("feed");
-  if (feed) {
+function parseRss(xml) {
+  // Check if it's Atom feed
+  if (xml.includes('<feed')) {
     return {
       type: "atom",
-      title: childText(feed, "title"),
-      link: childText(feed, "link"),
-      description: childText(feed, "subtitle"),
-      updated: childText(feed, "updated"),
-      items: [...feed.querySelectorAll("entry")].map(parseItem)
+      title: extractTag(xml, 'title'),
+      link: extractTag(xml, 'link'),
+      description: extractTag(xml, 'subtitle'),
+      updated: extractTag(xml, 'updated'),
+      items: extractItems(xml, 'entry')
     };
   }
   
-  const channel = doc.querySelector("channel");
-  if (channel) {
+  // Check if it's RSS feed
+  if (xml.includes('<rss') || xml.includes('<channel')) {
     return {
       type: "rss",
-      title: childText(channel, "title"),
-      link: childText(channel, "link"),
-      description: childText(channel, "description"),
-      lastBuild: childText(channel, "lastBuildDate"),
-      items: [...channel.querySelectorAll("item")].map(parseItem)
+      title: extractTag(xml, 'title'),
+      link: extractTag(xml, 'link'),
+      description: extractTag(xml, 'description'),
+      lastBuild: extractTag(xml, 'lastBuildDate'),
+      items: extractItems(xml, 'item')
     };
   }
   
   return { error: "Unrecognised feed format" };
+}
+
+function extractTag(xml, tagName) {
+  // Try multiple patterns for different tag formats
+  const patterns = [
+    new RegExp(`<${tagName}[^>]*>([\s\S]*?)<\/${tagName}>`, 'is'),
+    new RegExp(`<${tagName}[^>]*><!\\[CDATA\\[([\\s\\S]*?)\\]\\]><\\/${tagName}>`, 'is')
+  ];
+  
+  for (const pattern of patterns) {
+    const match = xml.match(pattern);
+    if (match) {
+      let content = match[1];
+      if (!content) continue;
+      
+      content = content.trim();
+      // Remove CDATA wrappers if present
+      content = content.replace(/^<!\[CDATA\[/, '').replace(/\]\]>$/, '');
+      // Clean up HTML entities and extra whitespace
+      content = content.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
+      content = content.replace(/\s+/g, ' ').trim();
+      
+      if (content) return content;
+    }
+  }
+  
+  return null;
+}
+
+function extractItems(xml, itemTag) {
+  // Try multiple regex patterns to catch items
+  const patterns = [
+    new RegExp(`<${itemTag}[^>]*>([\s\S]*?)<\/${itemTag}>`, 'gi'),
+    new RegExp(`<${itemTag}[^>]*>(.*?)<\/${itemTag}>`, 'gis'),
+    new RegExp(`<${itemTag}>([\s\S]*?)<\/${itemTag}>`, 'gi')
+  ];
+  
+  const items = [];
+  
+  for (const pattern of patterns) {
+    let match;
+    // Reset regex lastIndex
+    pattern.lastIndex = 0;
+    
+    while ((match = pattern.exec(xml)) !== null) {
+      const itemXml = match[1];
+      const item = {
+        title: extractTag(itemXml, 'title'),
+        link: extractTag(itemXml, 'link'),
+        description: extractTag(itemXml, 'description') || extractTag(itemXml, 'summary'),
+        pubDate: extractTag(itemXml, 'pubDate') || extractTag(itemXml, 'published') || extractTag(itemXml, 'updated'),
+        guid: extractTag(itemXml, 'guid') || extractTag(itemXml, 'id'),
+        author: extractTag(itemXml, 'author') || extractTag(itemXml, 'dc:creator'),
+        category: extractCategories(itemXml)
+      };
+      
+      // Only add if we have some content
+      if (item.title || item.link || item.description) {
+        items.push(item);
+      }
+    }
+    
+    // If we found items with this pattern, break
+    if (items.length > 0) break;
+  }
+  
+  return items;
+}
+
+function extractCategories(itemXml) {
+  const categoryRegex = /<category[^>]*>(.*?)<\/category>/gis;
+  const categories = [];
+  let match;
+  
+  while ((match = categoryRegex.exec(itemXml)) !== null) {
+    const category = match[1].trim();
+    if (category) categories.push(category);
+  }
+  
+  return categories;
 }
